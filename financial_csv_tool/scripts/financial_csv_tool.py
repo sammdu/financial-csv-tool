@@ -2,12 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # ///
-"""
-General-purpose, vendor-agnostic, context-agnostic transformer for financial statement CSVs
-(bank, card, vendor billing/receipts): reshapes any export into the columns a target importer
-expects. Keep vendor-, business-, and system-specific choices in command-line flags, never in
-this code.
-"""
+"""Vendor-agnostic financial CSV transformer; all context belongs in command-line flags."""
 import argparse
 import csv
 import sys
@@ -56,13 +51,13 @@ class Field:
         self.value = value
 
     @staticmethod
-    def pair(value):
+    def pair(value, empty=False):
         if "=" not in value:
             exit_with_error(f"expected KEY=VALUE, got {value!r}")
-        left, right = (side.strip() for side in value.split("=", 1))
-        if not left or not right:
+        left, right = value.split("=", 1)
+        if not left.strip() or (not empty and not right.strip()):
             exit_with_error(f"expected non-empty KEY=VALUE, got {value!r}")
-        return left, right
+        return left.strip(), right if empty else right.strip()
 
     def number(self):
         text = self.value.strip().lstrip("=").replace(",", "").replace('"', "")
@@ -226,22 +221,36 @@ class Table:
                 kept.append(row)
         self.rows = kept
 
-    def group(self, key, specs, agg_type, collapse):
+    def filter_values(self, specs):
+        for field, value in specs:
+            self.require(field, "where")
+            self.rows = [row for row in self.rows if row[field] == value]
+
+    def map_values(self, values):
+        target, source = Field.pair(values[0])
+        mapping = dict(map(Field.pair, values[1:]))
+        self.require(source, "map")
+        unknown = [value for value in dict.fromkeys(row[source] for row in self.rows) if value not in mapping]
+        if unknown:
+            exit_with_error(f"unmapped {source} value(s): {', '.join(unknown)}")
+        self.derive(target, lambda row: mapping[row[source]])
+
+    def group(self, key, specs, group_type, collapse):
         self.require(key, "group-by")
         for target, sources in specs:
             unknown = [c for c in sources if c not in self.headers]
             if unknown:
-                exit_with_error(f"missing agg source column(s): {', '.join(unknown)}")
+                exit_with_error(f"missing group source column(s): {', '.join(unknown)}")
         self.ensure(*(target for target, _ in specs))
         groups = {}
         for row in self.rows:
             groups.setdefault(row[key], []).append(row)
-        reduce, output = self.REDUCERS[agg_type], []
+        reduce, output = self.REDUCERS[group_type], []
         for rows in groups.values():
             values = {}
             for target, sources in specs:
                 value = reduce([sum(Field(row[column]).number() for column in sources) for row in rows])
-                values[target] = str(value) if agg_type == "count" else f"{value:.2f}"
+                values[target] = str(value) if group_type == "count" else f"{value:.2f}"
             if collapse:
                 output.append({**rows[0], **values})
                 continue
@@ -250,9 +259,13 @@ class Table:
             output.extend(rows)
         self.rows = output
 
-    def assemble(self, specs, columns, reverse, group_by=""):
+    def assemble(self, specs, columns, reverse, group_by="", expand_by=""):
         entries = []
-        for amount, rhs in (Field.pair(spec) for spec in specs):
+        if expand_by:
+            self.require(expand_by, "expand-by")
+        for spec in specs:
+            selector, rule = Field.pair(spec) if expand_by else ("", spec)
+            amount, rhs = Field.pair(rule)
             amounts = csv_items(amount)
             for column in amounts:
                 self.require(column, "expand")
@@ -260,7 +273,7 @@ class Table:
             side = side.strip().lower()
             if not name or side not in ("debit", "credit"):
                 exit_with_error(f"--expand needs AMOUNT_COL[,COL...]=ACCOUNT:debit|credit, got {rhs!r}")
-            entries.append((amounts, name.strip(), side))
+            entries.append((selector.strip(), amounts, name.strip(), side))
         account, debit, credit = columns[:3]
         if not entries:
             for column in columns:
@@ -270,7 +283,9 @@ class Table:
         previous, output = None, []
         for row in self.rows:
             lines = []
-            for amounts, name, side in entries:
+            for selector, amounts, name, side in entries:
+                if selector and selector not in ("*", row[expand_by]):
+                    continue
                 amount = sum(Field(row[column]).number() for column in amounts)
                 if amount < 0 and not reverse:
                     exit_with_error(
@@ -299,20 +314,24 @@ class Table:
         self.rows = output
 
     def transform(self, args, template_headers):
-        if args.agg and not args.group_by:
-            exit_with_error("--agg requires --group-by")
-        if args.collapse and not args.group_by:
-            exit_with_error("--collapse requires --group-by")
+        if args.group and not args.group_by:
+            exit_with_error("--group requires --group-by")
+        if args.group_collapse and not args.group_by:
+            exit_with_error("--group-collapse requires --group-by")
+        self.filter_values([Field.pair(value) for value in args.where])
         if args.group_by:
-            specs = [(target, csv_items(sources)) for target, sources in map(Field.pair, args.agg)]
-            self.group(args.group_by, specs, args.agg_type, args.collapse)
+            specs = [(target, csv_items(sources)) for target, sources in map(Field.pair, args.group)]
+            self.group(args.group_by, specs, args.group_type, args.group_collapse)
 
-        group_by = args.group_by
+        group_by, expand_by = args.group_by, args.expand_by
         for old, new in map(Field.pair, args.rename):
             self.rename(old, new)
             group_by = new if group_by == old else group_by
+            expand_by = new if expand_by == old else expand_by
         for values in args.split:
             self.split(values, args.strip_derived)
+        for values in args.map:
+            self.map_values(values)
 
         formats = [args.in_date_format] if args.in_date_format else Field.DATE_FORMATS
         for target, column in map(Field.pair, args.date):
@@ -323,11 +342,17 @@ class Table:
             high = Field(args.date_range_to).parse_date(formats, "--date-range-to")
             self.filter_dates(args.date_range_field, low, high, formats)
 
-        for specs, join in ((args.coalesce, None), (args.concat, args.concat_sep)):
-            for target, sources in map(Field.pair, specs):
-                self.combine(target, csv_items(sources), join, args.strip_derived)
+        for target, sources in map(Field.pair, args.coalesce):
+            self.combine(target, csv_items(sources), None, args.strip_derived)
+        concat_specs = list(map(Field.pair, args.concat))
+        concat_separators = dict(Field.pair(value, True) for value in args.concat_sep)
+        unknown = [target for target in concat_separators if target not in {target for target, _ in concat_specs}]
+        if unknown:
+            exit_with_error("--concat-sep target is not defined by --concat: " + ", ".join(unknown))
+        for target, sources in concat_specs:
+            self.combine(target, csv_items(sources), concat_separators.get(target, " "), args.strip_derived)
 
-        if args.expand or (args.group_by and not args.collapse):
+        if args.expand or (args.group_by and not args.group_collapse):
             columns = csv_items(args.expand_columns)
             if len(columns) < 3:
                 exit_with_error(
@@ -336,7 +361,7 @@ class Table:
             unknown = [column for column in columns if template_headers and column not in template_headers]
             if unknown:
                 exit_with_error("--template is missing expand output column(s): " + ", ".join(unknown))
-            self.assemble(args.expand, columns, args.expand_negative_reverses, group_by)
+            self.assemble(args.expand, columns, args.expand_negative_reverses, group_by, expand_by)
 
         available = set(self.headers) | set(template_headers)
         missing = [column for column in args.drop + args.keep + args.require if column not in available]
@@ -359,77 +384,40 @@ class Table:
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        description="Generic CSV transformer that reshapes transaction exports (bank, card, vendor billing) "
-        "into the columns another system expects, including group, expand, and collapse steps.",
-    )
+    parser = argparse.ArgumentParser(description="Reshape transaction CSVs with composable row and column transforms.")
+    repeat = {"action": "append", "default": []}
     parser.add_argument("input", type=Path, nargs="?", default=Path("-"))
     parser.add_argument("-o", "--output", type=Path)
-    parser.add_argument(
-        "--template", type=Path, help="CSV template whose header becomes the output columns when --keep is omitted."
-    )
+    parser.add_argument("--template", type=Path, help="CSV template supplying the output header.")
     parser.add_argument("--encoding", default="utf-8-sig")
     parser.add_argument("--delimiter", default=",", help="Input delimiter (default comma; use auto to detect).")
     parser.add_argument("--skip-lines-start", type=int, default=0)
     parser.add_argument("--skip-lines-end", type=int, default=0)
     parser.add_argument("--strip-cells", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strip-derived", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--rename", action="append", default=[], metavar="OLD=NEW")
-    parser.add_argument(
-        "--split",
-        action="append",
-        nargs="+",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Split one column into several: from=COL to=OUT1,OUT2 [delim=SEP|by=sign] [format=OUT:FORMAT,...].",
-    )
-    parser.add_argument("--date", action="append", default=[], metavar="OUT=COL")
+    parser.add_argument("--where", metavar="COL=VALUE", help="Keep exact matches; repeat for AND conditions.", **repeat)
+    parser.add_argument("--rename", metavar="OLD=NEW", **repeat)
+    parser.add_argument("--split", nargs="+", metavar="KEY=VALUE", help="Split: from=COL to=OUT1,OUT2 [delim=SEP|by=sign] [format=OUT:FORMAT,...].", **repeat)
+    parser.add_argument("--map", nargs="+", metavar="KEY=VALUE", help="Map: OUT=COL SOURCE=OUTPUT [SOURCE=OUTPUT ...].", **repeat)
+    parser.add_argument("--date", metavar="OUT=COL", **repeat)
     parser.add_argument("--in-date-format", default="")
     parser.add_argument("--out-date-format", default="%Y-%m-%d")
     parser.add_argument("--date-range-field", default="")
     parser.add_argument("--date-range-from", default="")
     parser.add_argument("--date-range-to", default="")
-    parser.add_argument("--coalesce", action="append", default=[], metavar="OUT=COL[,COL|literal:TEXT...]")
-    parser.add_argument("--concat", action="append", default=[], metavar="OUT=COL[,COL|literal:TEXT...]")
-    parser.add_argument("--concat-sep", default=" ")
-    parser.add_argument(
-        "--group-by",
-        default="",
-        metavar="COL",
-        help="Assemble rows sharing COL under one top entry.",
-    )
-    parser.add_argument(
-        "--agg",
-        action="append",
-        default=[],
-        metavar="OUT=COL[,COL...]",
-        help="Put the --agg-type reduction of grouped columns on the first row (summed per row first).",
-    )
-    parser.add_argument("--collapse", action="store_true", help="Collapse each --group-by group to its first row.")
-    parser.add_argument(
-        "--agg-type", default="sum", choices=list(Table.REDUCERS), help="Reduction applied by --agg (default sum)."
-    )
-    parser.add_argument(
-        "--expand",
-        action="append",
-        default=[],
-        metavar="AMOUNT_COL[,COL...]=ACCOUNT:debit|credit",
-        help="Create one output subentry; repeat to expand each input row into several.",
-    )
-    parser.add_argument(
-        "--expand-columns",
-        default="Account,Debit,Credit",
-        metavar="ACCOUNT,DEBIT,CREDIT[,OTHER...]",
-        help="Output subentry columns; additional columns remain populated on continuation rows.",
-    )
-    parser.add_argument(
-        "--expand-negative-reverses",
-        action="store_true",
-        help="Reverse debit/credit accounts for negative --expand amounts and write the positive magnitude.",
-    )
-    parser.add_argument("--drop", action="append", default=[])
-    parser.add_argument("--keep", action="append", default=[])
-    parser.add_argument("--require", action="append", default=[])
+    parser.add_argument("--coalesce", metavar="OUT=COL[,COL|literal:TEXT...]", **repeat)
+    parser.add_argument("--concat", metavar="OUT=COL[,COL|literal:TEXT...]", **repeat)
+    parser.add_argument("--concat-sep", metavar="OUT=SEP", help="Separator for one --concat output; default space.", **repeat)
+    parser.add_argument("--group-by", default="", metavar="COL", help="Assemble rows sharing COL.")
+    parser.add_argument("--group", metavar="OUT=COL[,COL...]", help="Reduce grouped columns with --group-type.", **repeat)
+    parser.add_argument("--group-collapse", action="store_true", help="Collapse each group to its first row.")
+    parser.add_argument("--group-type", default="sum", choices=list(Table.REDUCERS))
+    parser.add_argument("--expand-by", default="", metavar="COL", help="Select rules written VALUE=AMOUNT=ACCOUNT:side.")
+    parser.add_argument("--expand", metavar="AMOUNT_COL[,COL...]=ACCOUNT:debit|credit", **repeat)
+    parser.add_argument("--expand-columns", default="Account,Debit,Credit", metavar="ACCOUNT,DEBIT,CREDIT[,OTHER...]")
+    parser.add_argument("--expand-negative-reverses", action="store_true")
+    for flag in ("drop", "keep", "require"):
+        parser.add_argument(f"--{flag}", **repeat)
     return parser
 
 

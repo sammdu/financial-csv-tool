@@ -1,6 +1,6 @@
 # financial_csv_tool.py
 
-[`financial_csv_tool.py`](financial_csv_tool/scripts/financial_csv_tool.py) reshape transaction records & financial CSV statements from banks, credit cards, and vendors alike. Every transformation is supplied through command-line options.
+[`financial_csv_tool.py`](financial_csv_tool/scripts/financial_csv_tool.py) reshapes transaction records and financial CSV statements from banks, credit cards, and vendors. Every transformation is supplied through command-line options.
 
 ## Usage
 
@@ -14,11 +14,13 @@ Common operations:
 
 - trim metadata around useful figures
 - rename, split, coalesce, concatenate, keep, or drop columns
-- normalize and filter dates
-- group and aggregate rows, collapse groups, or expand transactions into debit/credit rows
+- filter rows by exact field values or dates
+- reduce related rows with grouping or expand rows into conditional debit/credit lines
 - adopt a template header and require populated output columns
 
 Run `uv run financial_csv_tool.py --help` for the complete option reference.
+
+Grouping and expansion are complementary: `--group-by` chooses the key used to reduce rows, while `--expand-by` chooses the field used to select expansion rules. Without `--expand-by`, every `--expand` rule applies to every row.
 
 ## Examples
 
@@ -46,22 +48,46 @@ Concatenate columns into one and fill a field from the first non-blank source (c
 uv run financial_csv_tool.py statement.csv --concat "Memo=Description,Reference" --coalesce "Party=Payee,literal:Unknown"
 ```
 
+Set separators per concatenated field; unspecified fields use a space:
+
+```sh
+uv run financial_csv_tool.py statement.csv --concat "Signed Amount=Sign,Magnitude" --concat "Memo=Date,Description" --concat-sep "Signed Amount="
+```
+
 Filter rows to a date range (row-wise):
 
 ```sh
 uv run financial_csv_tool.py statement.csv --date-range-field Date --date-range-from 2025-01-01 --date-range-to 2025-03-31
 ```
 
-Group rows by a key and sum a column, collapsing each group to one row (row-wise, aggregate):
+Filter rows by an exact field value (row-wise):
 
 ```sh
-uv run financial_csv_tool.py line_items.csv --group-by Category --agg "Total=Amount" --collapse
+uv run financial_csv_tool.py statement.csv --where "Type=Payment"
+```
+
+Group rows by a key and sum a column, collapsing each group to one row:
+
+```sh
+uv run financial_csv_tool.py line_items.csv --group-by Category --group "Total=Amount" --group-collapse
 ```
 
 Expand each transaction into balanced debit and credit rows (row-wise):
 
 ```sh
 uv run financial_csv_tool.py charges.csv --expand "Amount=Advertising:debit" --expand "Amount=Chequing:credit" --expand-negative-reverses
+```
+
+Select expansion rules from a row field:
+
+```sh
+uv run financial_csv_tool.py activity.csv \
+  --map "Entry Type=Type" "Charge=Journal Entry" "Payment=Bank Entry" \
+  --expand-by Type \
+  --expand "Charge=Amount=Expense:debit" \
+  --expand "Charge=Amount=Payable:credit" \
+  --expand "Payment=Amount=Payable:debit" \
+  --expand "Payment=Amount=Bank:credit"
 ```
 
 Transformations always follow the processing order documented in the bundled [skill instructions](./financial_csv_tool/SKILL.md), regardless of option order.
