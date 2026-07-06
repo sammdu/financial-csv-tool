@@ -1,0 +1,18 @@
+{
+  "skill_name": "financial_csv_tool",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Use financial_csv_tool.py to transform evals/fixtures/wrapped_statement.csv. Skip the two preamble lines and one footer line. Rename Date to Posting Date, split signed Amount into Deposit and Withdrawal, and emit only Posting Date, Description, Deposit, Withdrawal in that order. Save the result as output.csv. Reconcile the transaction count and amount total to the source.",
+      "expected_output": "A two-row output.csv with 125.40 in Deposit on 2026-01-03, 7.25 in Withdrawal on 2026-01-04, and a concise reconciliation confirming two transactions and a net source total of 118.15.",
+      "files": [
+        "evals/fixtures/wrapped_statement.csv"
+      ],
+      "expectations": [
+        "output.csv has the exact requested header and two data rows",
+        "The positive amount is 125.40 in Deposit and the negative amount is 7.25 in Withdrawal",
+        "The response reconciles two source transactions and a net total of 118.15"
+      ]
+    }
+  ]
+}
